@@ -205,7 +205,7 @@ findTrade m = do
     -- no best bid offer but best ask => new ask might improve the best ask
     matchAskToBid Nothing (Just (Offer bestAskPrice _)) o@(Offer newAskPrice _) _ = 
       if newAskPrice < bestAskPrice
-        then ImproveBid o -- yes, it improves
+        then ImproveAsk o -- yes, it improves
         else NoTrade      -- no improvement, ignore
     -- best bid offer exists, check if cross over
     matchAskToBid (Just (Offer bestBidPrice bi)) _ (Offer newAskPrice si) (Seller c) =
