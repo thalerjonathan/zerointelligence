@@ -1,9 +1,14 @@
 module Main where
 
-import Data.Maybe
+import System.IO
 import System.Random
+import Text.Printf
 
 import Control.Monad.Random
+
+--------------------------------------------------------------------------------
+-- CONSTANTS
+--------------------------------------------------------------------------------
 
 maxCost :: Double
 maxCost = 25
@@ -23,6 +28,10 @@ buyersCount = 500
 rngSeed :: Int
 rngSeed = 42
 
+--------------------------------------------------------------------------------
+-- TYPE DEFINITIONS
+--------------------------------------------------------------------------------
+
 -- http://people.brandeis.edu/~blebaron/classes/agentfin/GodeSunder.html
 
 -- a seller is characterised through a uniform randomly distributed value 
@@ -32,7 +41,14 @@ newtype Seller = Seller Double
 -- v between 0 and maxValue
 newtype Buyer = Buyer Double
 
-newtype Price = Price Double deriving Show
+type Price = Double
+
+data Offer = Offer Price Int
+
+data TradeInfo = Match Trade
+               | ImproveBid Offer
+               | ImproveAsk Offer
+               | NoTrade
 
 -- Trade contains:
 -- tx price, surplus, buyer index, seller index, buyer value, seller cost
@@ -42,26 +58,40 @@ data Market = Market
   { sellers      :: [Seller]
   , buyers       :: [Buyer]
 
-  , bestAsk      :: Maybe (Price, Int)
-  , bestBid      :: Maybe (Price, Int)
+  , bestAsk      :: Maybe Offer
+  , bestBid      :: Maybe Offer
 
   , prices       :: [Price]
   , surplus      :: Price
   , tradedValues :: [Price]
   , tradedCosts  :: [Price]
   }
+--------------------------------------------------------------------------------
+-- MAIN
+--------------------------------------------------------------------------------
 
 main :: IO ()
 main = do
-  let g  = mkStdGen 42
-      ps = evalRand runSimulation g
+    let g  = mkStdGen 42
+        ps = evalRand runSimulation g
 
-  print ps
+    exportPrices ps
+  where
+    exportPrices :: [Price] -> IO ()
+    exportPrices ps = do
+      fileHdl <- openFile "prices.m" WriteMode
+      hPutStrLn fileHdl "prices = ["
+      mapM_ (hPutStrLn fileHdl . printf "%f") ps
+      hPutStrLn fileHdl "];"
+      hClose fileHdl
+--------------------------------------------------------------------------------
+-- SIMULATION
+--------------------------------------------------------------------------------
 
 runSimulation :: RandomGen g => Rand g [Price]
 runSimulation = do
   ss <- map Seller . take sellersCount <$> getRandomRs (0, maxCost)
-  bs  <- map Buyer . take buyersCount <$> getRandomRs (0, maxValue)
+  bs <- map Buyer . take buyersCount <$> getRandomRs (0, maxValue)
   
   let m = Market {
     buyers       = bs
@@ -69,7 +99,7 @@ runSimulation = do
   , bestBid      = Nothing
   , bestAsk      = Nothing
   , prices       = []
-  , surplus      = Price 0
+  , surplus      = 0
   , tradedValues = []
   , tradedCosts  = []
   }
@@ -81,45 +111,99 @@ runSimulation = do
 iteration :: RandomGen g => Int -> Market -> Rand g Market
 iteration 0 m = return m -- all iterations consumed, finished
 iteration n m 
-  | null (buyers m) = return m -- no more agents which can trade, finished
-  | otherwise = do
-    -- find a trade
-    mayTrade <- findTrade m
-    -- no trade found, try another iteration
-    if isNothing mayTrade
-      then iteration (n-1) m
-      else do -- found a trade, transact it
-        let m' = txTrade (fromJust mayTrade) m
-        iteration (n-1) m'
+    | null (buyers m) = return m -- no more agents which can trade, finished
+    | otherwise = do
+      ti <- findTrade m
+      case ti of
+        Match t      -> iteration (n-1) (txTrade t)
+        ImproveAsk o -> iteration (n-1) (improveAsk o)
+        ImproveBid o -> iteration (n-1) (improveBid o)
+        NoTrade      -> iteration (n-1) m
 
-txTrade :: Trade -> Market -> Market
-txTrade (Trade txp surp bIdx sIdx bv sc) m = m'
   where
-    m' = m {
-      buyers       = removeElem bIdx (buyers m)
-    , sellers      = removeElem sIdx (sellers m)
-    , bestBid      = bestBid m
-    , bestAsk      = bestAsk m
-    , prices       = txp : prices m
-    , surplus      = priceSum surp (surplus m)
-    , tradedValues = bv : tradedValues m
-    , tradedCosts  = sc : tradedCosts m
-    }
+    txTrade :: Trade -> Market
+    txTrade (Trade txp surp bIdx sIdx bv sc) = m'
+      where
+        m' = m {
+          buyers       = removeElem bIdx (buyers m)
+        , sellers      = removeElem sIdx (sellers m)
+        , prices       = txp : prices m
+        , surplus      = surp + surplus m
+        , tradedValues = bv : tradedValues m
+        , tradedCosts  = sc : tradedCosts m
+        }
+
+    improveAsk :: Offer -> Market
+    improveAsk o = m { bestAsk = Just o }
+
+    improveBid :: Offer -> Market
+    improveBid o = m { bestBid = Just o }
+    
+findTrade :: RandomGen g => Market -> Rand g TradeInfo
+findTrade m = do
+  tryBuyers <- getRandom
+  if tryBuyers
+    then tradeBuyer
+    else tradeSeller
+  where
+    tradeBuyer :: RandomGen g => Rand g TradeInfo
+    tradeBuyer = do
+      (rb, bi) <- randElem (buyers m)
+      newBid   <- formBidPrice rb 
+
+      case bestAsk m of
+        Nothing ->
+          case bestBid m of
+            Nothing -> return $ ImproveBid (Offer newBid bi)
+            (Just (Offer bestBidPrice _)) ->
+              if newBid > bestBidPrice
+                then return $ ImproveBid (Offer newBid bi)
+                else return NoTrade
+        Just (Offer bestAskPrice si) -> 
+          if newBid > bestAskPrice
+            then do
+              let (Buyer v)  = rb
+                  (Seller c) = sellers m !! si
+                  surp       = v - c
+              return $ Match $ Trade bestAskPrice surp bi si v c
+            else return NoTrade
+
+    tradeSeller :: RandomGen g => Rand g TradeInfo
+    tradeSeller = do
+      (rs, si) <- randElem (sellers m)
+      newAsk   <- formAskPrice rs
+
+      case bestBid m of
+        Nothing ->
+          case bestAsk m of
+            Nothing -> return $ ImproveAsk (Offer newAsk si)
+            (Just (Offer bestAskPrice _)) ->
+              if newAsk < bestAskPrice
+                then return $ ImproveBid (Offer newAsk si)
+                else return NoTrade
+        Just (Offer bestBidPrice bi) -> 
+          if bestBidPrice > newAsk
+            then do
+              let (Seller c) = rs
+                  (Buyer v)  = buyers m !! bi 
+                  surp       = v - c
+              return $ Match $ Trade bestBidPrice surp bi si v c
+            else return NoTrade
+
+    formBidPrice :: RandomGen g => Buyer -> Rand g Price
+    formBidPrice (Buyer v) = getRandomR (0, v)
+
+    formAskPrice :: RandomGen g => Seller -> Rand g Price
+    formAskPrice (Seller c) = getRandomR (c, maxCost)
+
+--------------------------------------------------------------------------------
+-- Utilities
+--------------------------------------------------------------------------------
 
 removeElem :: Int -> [a] -> [a]
 removeElem idx xs = take idx xs ++ drop (idx + 1) xs 
 
-priceSum :: Price -> Price -> Price
-priceSum (Price p1) (Price p2) = Price (p1 + p2)
-
-findTrade :: RandomGen g => Market -> Rand g (Maybe Trade)
-findTrade _m = do
-  tryBuyers <- getRandom
-  if tryBuyers
-    then do
-      
-      return Nothing
-    else return Nothing
-
-formBid :: Buyer -> Price
-formBid (Buyer v) = Price v
+randElem :: RandomGen g => [a] -> Rand g (a, Int)
+randElem xs = do
+  ri <- getRandomR (0, length xs - 1)
+  return (xs !! ri, ri)
