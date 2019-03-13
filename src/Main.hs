@@ -19,11 +19,8 @@ maxValue = 25
 iterations :: Int
 iterations = 50000
 
-sellersCount :: Int
-sellersCount = 500
-
-buyersCount :: Int
-buyersCount = 500
+tradersCount :: Int
+tradersCount = 500
 
 rngSeed :: Int
 rngSeed = 42
@@ -43,8 +40,10 @@ newtype Buyer = Buyer Double
 
 type Price = Double
 
+-- An offer holds the price and the index of the respective agent in its list
 data Offer = Offer Price Int
 
+-- possible outcomes of trade-matching algorithm
 data TradeInfo = Match Trade
                | ImproveBid Offer
                | ImproveAsk Offer
@@ -83,16 +82,22 @@ main = do
       hPutStrLn fileHdl "prices = ["
       mapM_ (hPutStrLn fileHdl . printf "%f") ps
       hPutStrLn fileHdl "];"
+      hPutStrLn fileHdl "windowSize = 50;" 
+      hPutStrLn fileHdl "b = (1/windowSize)*ones(1,windowSize);"
+      hPutStrLn fileHdl "a = 1;"
+      hPutStrLn fileHdl "filterPrices = filter(b,a,prices);"
+      hPutStrLn fileHdl "plot(filterPrices);"
       hClose fileHdl
+
 --------------------------------------------------------------------------------
 -- SIMULATION
 --------------------------------------------------------------------------------
 
 runSimulation :: RandomGen g => Rand g [Price]
 runSimulation = do
-  ss <- map Seller . take sellersCount <$> getRandomRs (0, maxCost)
-  bs <- map Buyer . take buyersCount <$> getRandomRs (0, maxValue)
-  
+  bs <- map Buyer . take tradersCount <$> getRandomRs (0, maxValue)
+  ss <- map Seller . take tradersCount <$> getRandomRs (0, maxCost)
+
   let m = Market {
     buyers       = bs
   , sellers      = ss
@@ -106,7 +111,8 @@ runSimulation = do
 
   m' <- iteration iterations m
 
-  return $ prices m'
+  -- need to reverse, because prices are appended at the front
+  return $ reverse $ prices m'
 
 iteration :: RandomGen g => Int -> Market -> Rand g Market
 iteration 0 m = return m -- all iterations consumed, finished
@@ -122,11 +128,13 @@ iteration n m
 
   where
     txTrade :: Trade -> Market
-    txTrade (Trade txp surp bIdx sIdx bv sc) = m'
+    txTrade (Trade txp surp bi si bv sc) = m'
       where
         m' = m {
-          buyers       = removeElem bIdx (buyers m)
-        , sellers      = removeElem sIdx (sellers m)
+          buyers       = removeElem bi (buyers m)
+        , sellers      = removeElem si (sellers m)
+        , bestAsk      = Nothing -- clear order book
+        , bestBid      = Nothing -- clear order book
         , prices       = txp : prices m
         , surplus      = surp + surplus m
         , tradedValues = bv : tradedValues m
@@ -148,53 +156,65 @@ findTrade m = do
   where
     tradeBuyer :: RandomGen g => Rand g TradeInfo
     tradeBuyer = do
-      (rb, bi) <- randElem (buyers m)
-      newBid   <- formBidPrice rb 
-
-      case bestAsk m of
-        Nothing ->
-          case bestBid m of
-            Nothing -> return $ ImproveBid (Offer newBid bi)
-            (Just (Offer bestBidPrice _)) ->
-              if newBid > bestBidPrice
-                then return $ ImproveBid (Offer newBid bi)
-                else return NoTrade
-        Just (Offer bestAskPrice si) -> 
-          if newBid > bestAskPrice
-            then do
-              let (Buyer v)  = rb
-                  (Seller c) = sellers m !! si
-                  surp       = v - c
-              return $ Match $ Trade bestAskPrice surp bi si v c
-            else return NoTrade
-
-    tradeSeller :: RandomGen g => Rand g TradeInfo
-    tradeSeller = do
-      (rs, si) <- randElem (sellers m)
-      newAsk   <- formAskPrice rs
-
-      case bestBid m of
-        Nothing ->
-          case bestAsk m of
-            Nothing -> return $ ImproveAsk (Offer newAsk si)
-            (Just (Offer bestAskPrice _)) ->
-              if newAsk < bestAskPrice
-                then return $ ImproveBid (Offer newAsk si)
-                else return NoTrade
-        Just (Offer bestBidPrice bi) -> 
-          if bestBidPrice > newAsk
-            then do
-              let (Seller c) = rs
-                  (Buyer v)  = buyers m !! bi 
-                  surp       = v - c
-              return $ Match $ Trade bestBidPrice surp bi si v c
-            else return NoTrade
+      (rb, bi)    <- randElem (buyers m)
+      newBidPrice <- formBidPrice rb 
+      return $ matchBidToAsk (bestAsk m) (bestBid m) (Offer newBidPrice bi) rb
 
     formBidPrice :: RandomGen g => Buyer -> Rand g Price
     formBidPrice (Buyer v) = getRandomR (0, v)
 
+    matchBidToAsk :: Maybe Offer -- ^ best ask in order book
+                  -> Maybe Offer -- ^ best bid in order book
+                  -> Offer       -- ^ new bid offer
+                  -> Buyer       -- ^ buyer of new bid offer
+                  -> TradeInfo
+    -- no best ask or best bid => set this new bid offer as best bid
+    matchBidToAsk Nothing Nothing o _ 
+      = ImproveBid o
+    -- no best ask offer but best bid => new bid might improve the best bid
+    matchBidToAsk Nothing (Just (Offer bestBidPrice _)) o@(Offer newBidPrice _) _ = 
+      if newBidPrice > bestBidPrice
+        then ImproveBid o -- yes, it improves
+        else NoTrade      -- no improvement, ignore
+    -- best ask offer exists, check if cross over
+    matchBidToAsk (Just (Offer bestAskPrice si)) _ (Offer newBidPrice bi) (Buyer v) =
+      if newBidPrice > bestAskPrice
+        then Match $ Trade bestAskPrice surp bi si v c -- yes, crossover => trade
+        else NoTrade  -- no crossover, ignore
+      where
+        (Seller c) = sellers m !! si
+        surp       = v - c
+
+    tradeSeller :: RandomGen g => Rand g TradeInfo
+    tradeSeller = do
+      (rs, si)    <- randElem (sellers m)
+      newAskPrice <- formAskPrice rs
+      return $ matchAskToBid (bestBid m) (bestAsk m) (Offer newAskPrice si) rs
+
     formAskPrice :: RandomGen g => Seller -> Rand g Price
     formAskPrice (Seller c) = getRandomR (c, maxCost)
+
+    matchAskToBid :: Maybe Offer -- ^ best bid in order book
+                  -> Maybe Offer -- ^ best ask in order book
+                  -> Offer       -- ^ new ask offer
+                  -> Seller      -- ^ seller of new ask offer
+                  -> TradeInfo
+    -- no best bid or best ask => set this new ask offer as best ask
+    matchAskToBid Nothing Nothing o _ 
+      = ImproveAsk o
+    -- no best bid offer but best ask => new ask might improve the best ask
+    matchAskToBid Nothing (Just (Offer bestAskPrice _)) o@(Offer newAskPrice _) _ = 
+      if newAskPrice < bestAskPrice
+        then ImproveBid o -- yes, it improves
+        else NoTrade      -- no improvement, ignore
+    -- best bid offer exists, check if cross over
+    matchAskToBid (Just (Offer bestBidPrice bi)) _ (Offer newAskPrice si) (Seller c) =
+      if bestBidPrice > newAskPrice
+        then Match $ Trade bestBidPrice surp bi si v c -- yes crossover: trade!
+        else NoTrade  -- no crossover, ignore
+      where
+        (Buyer v) = buyers m !! bi 
+        surp      = v - c
 
 --------------------------------------------------------------------------------
 -- Utilities
